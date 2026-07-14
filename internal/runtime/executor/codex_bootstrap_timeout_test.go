@@ -103,12 +103,122 @@ func TestCodexExecutorBootstrapTimeoutAfterHeaders(t *testing.T) {
 	}
 }
 
+func TestCodexExecutorBootstrapTimeoutLeavesParentContextActive(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	executor, auth := newCodexBootstrapTestExecutor(server.URL)
+	parentCtx, cancelParent := context.WithCancel(context.Background())
+	defer cancelParent()
+	_, err := executeCodexBootstrapTestStream(parentCtx, executor, auth)
+	if err == nil {
+		t.Fatal("expected bootstrap timeout")
+	}
+	statusErr, ok := err.(interface{ StatusCode() int })
+	if !ok || statusErr.StatusCode() != http.StatusGatewayTimeout {
+		t.Fatalf("error = %T %v, want HTTP 504", err, err)
+	}
+	if errParent := parentCtx.Err(); errParent != nil {
+		t.Fatalf("parent context error = %v, want nil", errParent)
+	}
+}
+
+func TestCodexExecutorBootstrapNon2xxPreservesStatus(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		w.(http.Flusher).Flush()
+		time.Sleep(1500 * time.Millisecond)
+		_, _ = w.Write([]byte(`{"error":{"message":"rate limited"}}`))
+	}))
+	defer server.Close()
+
+	executor, auth := newCodexBootstrapTestExecutor(server.URL)
+	_, err := executeCodexBootstrapTestStream(context.Background(), executor, auth)
+	if err == nil {
+		t.Fatal("expected non-2xx error")
+	}
+	statusErr, ok := err.(interface{ StatusCode() int })
+	if !ok || statusErr.StatusCode() != http.StatusTooManyRequests {
+		t.Fatalf("error = %T %v, want HTTP 429", err, err)
+	}
+}
+
+func TestCodexExecutorBootstrapCleanEmptyStream(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+	}))
+	defer server.Close()
+
+	executor, auth := newCodexBootstrapTestExecutor(server.URL)
+	result, err := executeCodexBootstrapTestStream(context.Background(), executor, auth)
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("unexpected stream error: %v", chunk.Err)
+		}
+		if len(chunk.Payload) > 0 {
+			t.Fatalf("unexpected stream payload: %q", chunk.Payload)
+		}
+	}
+}
+
+func TestCodexExecutorBootstrapObservesRawDataBeforeIdentityTransform(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.5\"}}\n\n"))
+		w.(http.Flusher).Flush()
+		time.Sleep(2200 * time.Millisecond)
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"output\":[]}}\n\n"))
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{SDKConfig: config.SDKConfig{Streaming: config.StreamingConfig{BootstrapTimeoutSeconds: 1}}}
+	cfg.Codex.IdentityConfuse = true
+	cfg.Routing.SessionAffinity = true
+	executor := NewCodexExecutor(cfg)
+	auth := &cliproxyauth.Auth{ID: "auth-1", Attributes: map[string]string{
+		"base_url": server.URL,
+		"api_key":  "test",
+	}}
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.5",
+		Payload: []byte(`{"model":"gpt-5.5","input":"Say ok","prompt_cache_key":"data:"}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+		Stream:       true,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+	var payload []byte
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("unexpected stream error: %v", chunk.Err)
+		}
+		payload = append(payload, chunk.Payload...)
+	}
+	if !bytes.Contains(payload, []byte("response.completed")) {
+		t.Fatalf("completed event missing from %q", payload)
+	}
+}
+
 func TestCodexExecutorBootstrapTimeoutDisarmsAfterFirstEvent(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write([]byte("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.5\"}}\n\n"))
 		w.(http.Flusher).Flush()
-		time.Sleep(1100 * time.Millisecond)
+		time.Sleep(2500 * time.Millisecond)
 		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"output\":[]}}\n\n"))
 	}))
 	defer server.Close()
