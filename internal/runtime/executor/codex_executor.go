@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	codexauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
@@ -41,6 +42,12 @@ const (
 	codexResponsesLiteHeader   = "X-OpenAI-Internal-Codex-Responses-Lite"
 	codexResponsesLiteMetadata = "client_metadata.ws_request_header_x_openai_internal_codex_responses_lite"
 	maxCodexBootstrapTimeout   = 10 * time.Minute
+)
+
+const (
+	codexBootstrapPending uint32 = iota
+	codexBootstrapObserved
+	codexBootstrapExpired
 )
 
 var dataTag = []byte("data:")
@@ -1134,13 +1141,57 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 
 	httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
+	bootstrapTimeout := codexBootstrapTimeout(e.cfg)
+	var bootstrapState atomic.Uint32
+	var bootstrapTimer *time.Timer
+	var timeoutErr statusErr
+	var cancelAttempt context.CancelCauseFunc
+	if bootstrapTimeout > 0 {
+		timeoutErr = codexBootstrapTimeoutError(bootstrapTimeout)
+		attemptCtx, cancel := context.WithCancelCause(httpReq.Context())
+		cancelAttempt = cancel
+		httpReq = httpReq.WithContext(attemptCtx)
+		bootstrapTimer = time.AfterFunc(bootstrapTimeout, func() {
+			if bootstrapState.CompareAndSwap(codexBootstrapPending, codexBootstrapExpired) {
+				cancelAttempt(timeoutErr)
+			}
+		})
+	}
+	observeBootstrap := func() bool {
+		if bootstrapTimer == nil {
+			return true
+		}
+		if bootstrapState.CompareAndSwap(codexBootstrapPending, codexBootstrapObserved) {
+			bootstrapTimer.Stop()
+			return true
+		}
+		return bootstrapState.Load() == codexBootstrapObserved
+	}
+	attemptOwnedByStream := false
+	defer func() {
+		if cancelAttempt != nil && !attemptOwnedByStream {
+			observeBootstrap()
+			cancelAttempt(nil)
+		}
+	}()
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
+		if !observeBootstrap() && ctx.Err() == nil {
+			err = timeoutErr
+		}
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return nil, err
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		if !observeBootstrap() && ctx.Err() == nil {
+			if errClose := httpResp.Body.Close(); errClose != nil {
+				log.Errorf("codex executor: close response body error: %v", errClose)
+			}
+			helps.RecordAPIResponseError(ctx, e.cfg, timeoutErr)
+			err = timeoutErr
+			return nil, err
+		}
 		data, readErr := io.ReadAll(httpResp.Body)
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("codex executor: close response body error: %v", errClose)
@@ -1159,6 +1210,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		return nil, err
 	}
 	out := make(chan cliproxyexecutor.StreamChunk)
+	attemptOwnedByStream = true
 	go func() {
 		defer close(out)
 		defer func() {
@@ -1166,6 +1218,10 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				log.Errorf("codex executor: close response body error: %v", errClose)
 			}
 		}()
+		if cancelAttempt != nil {
+			defer cancelAttempt(nil)
+		}
+		defer observeBootstrap()
 		scanner := bufio.NewScanner(httpResp.Body)
 		scanner.Buffer(nil, 52_428_800) // 50MB
 		var param any
@@ -1178,6 +1234,17 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 
 			if bytes.HasPrefix(line, dataTag) {
 				data := bytes.TrimSpace(line[5:])
+				if len(data) > 0 && !observeBootstrap() {
+					if ctx.Err() == nil {
+						helps.RecordAPIResponseError(ctx, e.cfg, timeoutErr)
+						reporter.PublishFailure(ctx, timeoutErr)
+						select {
+						case out <- cliproxyexecutor.StreamChunk{Err: timeoutErr}:
+						case <-ctx.Done():
+						}
+					}
+					return
+				}
 				if streamErr, terminalBody, ok := codexTerminalStreamErr(data); ok {
 					if errClearReplay := clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, streamErr.StatusCode(), terminalBody); errClearReplay != nil {
 						helps.RecordAPIResponseError(ctx, e.cfg, errClearReplay)
@@ -1220,7 +1287,17 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				}
 			}
 		}
-		if errScan := scanner.Err(); errScan != nil {
+		errScan := scanner.Err()
+		if !observeBootstrap() && ctx.Err() == nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, timeoutErr)
+			reporter.PublishFailure(ctx, timeoutErr)
+			select {
+			case out <- cliproxyexecutor.StreamChunk{Err: timeoutErr}:
+			case <-ctx.Done():
+			}
+			return
+		}
+		if errScan != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
 			reporter.PublishFailure(ctx, errScan)
 			select {
