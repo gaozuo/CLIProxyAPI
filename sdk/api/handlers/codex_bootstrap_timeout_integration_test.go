@@ -3,6 +3,7 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -17,11 +18,21 @@ import (
 )
 
 func TestCodexBootstrapTimeoutRotatesAffinityAcrossPriorities(t *testing.T) {
+	writeCompleted := func(w http.ResponseWriter, responseID string) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprintf(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":%q,\"object\":\"response\",\"created_at\":1775555723,\"status\":\"completed\",\"model\":\"gpt-5.5\",\"output\":[],\"usage\":{\"input_tokens\":8,\"output_tokens\":4,\"total_tokens\":12}}}\n\n", responseID)
+	}
+
 	var stalledCalls atomic.Int32
+	var stallEnabled atomic.Bool
 	stalledCanceled := make(chan struct{})
 	stalledServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		stalledCalls.Add(1)
 		_, _ = io.Copy(io.Discard, r.Body)
+		if !stallEnabled.Load() {
+			writeCompleted(w, "resp_affinity_bound")
+			return
+		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
 		w.(http.Flusher).Flush()
@@ -34,8 +45,7 @@ func TestCodexBootstrapTimeoutRotatesAffinityAcrossPriorities(t *testing.T) {
 	healthyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		healthyCalls.Add(1)
 		_, _ = io.Copy(io.Discard, r.Body)
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_healthy\",\"object\":\"response\",\"created_at\":1775555723,\"status\":\"completed\",\"model\":\"gpt-5.5\",\"output\":[],\"usage\":{\"input_tokens\":8,\"output_tokens\":4,\"total_tokens\":12}}}\n\n"))
+		writeCompleted(w, "resp_healthy")
 	}))
 	defer healthyServer.Close()
 
@@ -50,23 +60,23 @@ func TestCodexBootstrapTimeoutRotatesAffinityAcrossPriorities(t *testing.T) {
 
 	auths := []*coreauth.Auth{
 		{
-			ID:       "codex-bootstrap-priority-10",
+			ID:       "z-codex-bootstrap-priority-10",
 			Provider: "codex",
 			Status:   coreauth.StatusActive,
 			Attributes: map[string]string{
 				"api_key":  "test-stalled",
 				"base_url": stalledServer.URL,
-				"priority": "10",
+				"priority": "0",
 			},
 		},
 		{
-			ID:       "codex-bootstrap-priority-5",
+			ID:       "a-codex-bootstrap-priority-5",
 			Provider: "codex",
 			Status:   coreauth.StatusActive,
 			Attributes: map[string]string{
 				"api_key":  "test-healthy",
 				"base_url": healthyServer.URL,
-				"priority": "5",
+				"priority": "0",
 			},
 		},
 	}
@@ -80,6 +90,47 @@ func TestCodexBootstrapTimeoutRotatesAffinityAcrossPriorities(t *testing.T) {
 	}
 
 	handler := NewBaseAPIHandlers(&cfg.SDKConfig, manager)
+	warmupBody := []byte(`{"model":"gpt-5.5","input":"Warm up","stream":true,"conversation_id":"affinity-cursor-warmup"}`)
+	requestBody := []byte(`{"model":"gpt-5.5","input":"Say ok","stream":true,"conversation_id":"sticky-bootstrap-timeout"}`)
+	executeSuccessfulRequest := func(label string, body []byte) {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		data, _, errs := handler.ExecuteStreamWithAuthManager(ctx, "openai-response", "gpt-5.5", body, "")
+		var response []byte
+		for chunk := range data {
+			response = append(response, chunk...)
+		}
+		for errMessage := range errs {
+			if errMessage != nil {
+				t.Fatalf("%s unexpected terminal error: status=%d err=%v", label, errMessage.StatusCode, errMessage.Error)
+			}
+		}
+		if !bytes.Contains(response, []byte("response.completed")) {
+			t.Fatalf("%s completion missing from body %q", label, response)
+		}
+	}
+
+	executeSuccessfulRequest("warmup", warmupBody)
+	executeSuccessfulRequest("affinity bind", requestBody)
+	executeSuccessfulRequest("affinity hit", requestBody)
+	if got := healthyCalls.Load(); got != 1 {
+		t.Fatalf("healthy auth preflight calls = %d, want 1", got)
+	}
+	if got := stalledCalls.Load(); got != 2 {
+		t.Fatalf("affinity-bound auth preflight calls = %d, want 2", got)
+	}
+
+	auths[0].Attributes["priority"] = "10"
+	auths[1].Attributes["priority"] = "5"
+	for _, auth := range auths {
+		if _, errUpdate := manager.Update(context.Background(), auth); errUpdate != nil {
+			t.Fatalf("manager.Update(%s): %v", auth.ID, errUpdate)
+		}
+	}
+	stalledCalls.Store(0)
+	healthyCalls.Store(0)
+	stallEnabled.Store(true)
+
 	requestCtx, cancelRequest := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelRequest()
 
@@ -88,7 +139,7 @@ func TestCodexBootstrapTimeoutRotatesAffinityAcrossPriorities(t *testing.T) {
 		requestCtx,
 		"openai-response",
 		"gpt-5.5",
-		[]byte(`{"model":"gpt-5.5","input":"Say ok","stream":true,"conversation_id":"sticky-bootstrap-timeout"}`),
+		requestBody,
 		"",
 	)
 	var body []byte
