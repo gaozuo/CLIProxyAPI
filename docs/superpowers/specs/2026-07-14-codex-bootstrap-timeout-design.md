@@ -34,13 +34,15 @@ If the first non-empty SSE `data:` event wins, the timer is stopped permanently.
 
 ## Concurrency
 
-A three-state atomic value coordinates the timer callback and stream scanner:
+A three-state value protected by one function-local `sync.Mutex` coordinates the timer callback and stream scanner:
 
 - pending: no first event and no timeout;
 - observed: first event or explicit HTTP result won;
 - expired: timeout won and canceled the attempt.
 
-Only a compare-and-swap from pending can win. This prevents a boundary race from both forwarding a first event and reporting a timeout. No custom context implementation or parent-watcher goroutine is introduced.
+Only a transition from pending while holding the mutex can win. The timer callback changes pending to expired, releases the mutex, and then cancels the attempt. The response path changes pending to observed and stops the timer while holding the same mutex. This prevents a boundary race from both forwarding a first event and reporting a timeout.
+
+The feature must add no `sync/atomic` import or `atomic.*` operation in production or test code. It also must not introduce a custom context implementation or parent-watcher goroutine.
 
 ## Error Handling
 
@@ -65,7 +67,24 @@ An explicit non-2xx HTTP response stops the bootstrap timer and keeps its origin
 4. A first event before the deadline disarms the timeout and permits a longer healthy stream.
 5. A real two-server integration test enables session affinity and different priorities; the high-priority credential stalls and the same request succeeds through the lower-priority credential.
 6. Targeted race tests, package tests, full repository tests, and server build.
+7. A branch-diff scan from the official base must find no newly added `sync/atomic` import or `atomic.*` operation.
+
+## Isolated Real-Account Verification
+
+Real-account verification runs on the production host without replacing, restarting, or reconfiguring the production CLIProxyAPI service.
+
+- Build the candidate binary from the reviewed branch.
+- Create a temporary directory on the production host and copy, rather than mount, selected Codex account files into it with restrictive permissions.
+- Start the candidate on a loopback-only alternate port with its own temporary configuration, log path, and copied auth directory.
+- Run a local black-hole HTTP proxy on another loopback-only port. The high-priority copied credential uses this proxy so its CONNECT operation stalls without reaching the provider.
+- Keep a different copied real credential at lower priority with normal direct upstream access.
+- Enable session affinity and a short bootstrap timeout in the isolated configuration, then issue a real Codex request with a stable conversation ID.
+- Require logs and response timing to prove that the high-priority credential was selected first, canceled at the configured timeout, marked unavailable for the request, and replaced by the lower-priority real credential, which returns a successful first event and completion.
+- Also run one real request with the timeout disabled and one healthy direct request with the timeout enabled to prove default-off behavior and healthy disarm behavior.
+- Remove the isolated process, black-hole proxy, copied credentials, logs, configuration, and temporary directory after collecting redacted evidence.
+
+No production credential contents, access tokens, refresh tokens, SSH passwords, or API keys may be printed, downloaded to the local workstation, committed, or included in the PR.
 
 ## Rollout
 
-Ship the setting disabled. For production, begin with 20 seconds and one controlled canary instance. Monitor timeout counts, credential rotation, duplicate-request indicators, and successful recovery before enabling broadly.
+Ship the setting disabled. The isolated real-account test is validation only and does not enable the setting on the production service. A later production rollout should begin with 20 seconds on one controlled canary instance and monitor timeout counts, credential rotation, duplicate-request indicators, and successful recovery before enabling broadly.
