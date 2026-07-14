@@ -92,6 +92,7 @@ func TestCodexBootstrapTimeoutRotatesAffinityAcrossPriorities(t *testing.T) {
 	handler := NewBaseAPIHandlers(&cfg.SDKConfig, manager)
 	warmupBody := []byte(`{"model":"gpt-5.5","input":"Warm up","stream":true,"conversation_id":"affinity-cursor-warmup"}`)
 	requestBody := []byte(`{"model":"gpt-5.5","input":"Say ok","stream":true,"conversation_id":"sticky-bootstrap-timeout"}`)
+	priorityProbeBody := []byte(`{"model":"gpt-5.5","input":"Probe priority","stream":true,"conversation_id":"priority-selection-probe"}`)
 	executeSuccessfulRequest := func(label string, body []byte) {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
@@ -127,6 +128,16 @@ func TestCodexBootstrapTimeoutRotatesAffinityAcrossPriorities(t *testing.T) {
 			t.Fatalf("manager.Update(%s): %v", auth.ID, errUpdate)
 		}
 	}
+	stalledCalls.Store(0)
+	healthyCalls.Store(0)
+	executeSuccessfulRequest("priority probe", priorityProbeBody)
+	if got := stalledCalls.Load(); got != 1 {
+		t.Fatalf("higher-priority auth calls during priority probe = %d, want 1", got)
+	}
+	if got := healthyCalls.Load(); got != 0 {
+		t.Fatalf("lexically earlier lower-priority auth calls during priority probe = %d, want 0", got)
+	}
+
 	stalledCalls.Store(0)
 	healthyCalls.Store(0)
 	stallEnabled.Store(true)
