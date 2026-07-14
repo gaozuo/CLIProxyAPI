@@ -117,14 +117,14 @@ func (t *utlsRoundTripper) createConnection(ctx context.Context, host, addr stri
 	tlsConn := tls.UClient(conn, tlsConfig, tls.HelloChrome_Auto)
 
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		if errContext := context.Cause(ctx); errContext != nil {
 			return nil, errContext
 		}
 		return nil, err
 	}
 	if errContext := context.Cause(ctx); errContext != nil {
-		tlsConn.Close()
+		_ = tlsConn.Close()
 		return nil, errContext
 	}
 
