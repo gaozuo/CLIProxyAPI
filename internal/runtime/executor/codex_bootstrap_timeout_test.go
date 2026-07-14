@@ -3,6 +3,7 @@ package executor
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -24,6 +25,53 @@ func TestCodexBootstrapTimeoutBounds(t *testing.T) {
 	}
 	if got := codexBootstrapTimeout(&config.Config{SDKConfig: config.SDKConfig{Streaming: config.StreamingConfig{BootstrapTimeoutSeconds: 9999}}}); got != 10*time.Minute {
 		t.Fatalf("capped timeout = %s, want 10m", got)
+	}
+}
+
+func TestCodexBootstrapTimeoutDisabledUsesParentDeadline(t *testing.T) {
+	tests := []struct {
+		name           string
+		timeoutSeconds int
+	}{
+		{name: "zero", timeoutSeconds: 0},
+		{name: "negative", timeoutSeconds: -1},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			canceled := make(chan struct{})
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.Copy(io.Discard, r.Body)
+				<-r.Context().Done()
+				close(canceled)
+			}))
+			defer server.Close()
+
+			cfg := &config.Config{SDKConfig: config.SDKConfig{Streaming: config.StreamingConfig{
+				BootstrapTimeoutSeconds: test.timeoutSeconds,
+			}}}
+			executor := NewCodexExecutor(cfg)
+			auth := &cliproxyauth.Auth{Attributes: map[string]string{
+				"base_url": server.URL,
+				"api_key":  "test",
+			}}
+			parentCtx, cancelParent := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancelParent()
+
+			_, errExecute := executeCodexBootstrapTestStream(parentCtx, executor, auth)
+			if !errors.Is(errExecute, context.DeadlineExceeded) {
+				t.Fatalf("ExecuteStream error = %v, want parent deadline exceeded", errExecute)
+			}
+			var statusError interface{ StatusCode() int }
+			if errors.As(errExecute, &statusError) && statusError.StatusCode() == http.StatusGatewayTimeout {
+				t.Fatalf("ExecuteStream error = %v, must not be HTTP 504", errExecute)
+			}
+			select {
+			case <-canceled:
+			case <-time.After(time.Second):
+				t.Fatal("silent upstream request was not canceled by parent deadline")
+			}
+		})
 	}
 }
 

@@ -78,6 +78,31 @@ func (t *utlsRoundTripper) getOrCreateConnection(ctx context.Context, host, addr
 	}
 }
 
+func newHTTP2ClientConn(ctx context.Context, conn net.Conn) (*http2.ClientConn, error) {
+	cancelDone := make(chan struct{})
+	stopCancel := context.AfterFunc(ctx, func() {
+		_ = conn.Close()
+		close(cancelDone)
+	})
+
+	h2Conn, err := (&http2.Transport{}).NewClientConn(conn)
+	if !stopCancel() {
+		<-cancelDone
+	}
+	if err != nil {
+		_ = conn.Close()
+		if errContext := context.Cause(ctx); errContext != nil {
+			return nil, errContext
+		}
+		return nil, err
+	}
+	if errContext := context.Cause(ctx); errContext != nil {
+		_ = conn.Close()
+		return nil, errContext
+	}
+	return h2Conn, nil
+}
+
 func (t *utlsRoundTripper) createConnection(ctx context.Context, host, addr string) (*http2.ClientConn, error) {
 	contextDialer, ok := t.dialer.(proxy.ContextDialer)
 	if !ok {
@@ -103,14 +128,7 @@ func (t *utlsRoundTripper) createConnection(ctx context.Context, host, addr stri
 		return nil, errContext
 	}
 
-	tr := &http2.Transport{}
-	h2Conn, err := tr.NewClientConn(tlsConn)
-	if err != nil {
-		tlsConn.Close()
-		return nil, err
-	}
-
-	return h2Conn, nil
+	return newHTTP2ClientConn(ctx, tlsConn)
 }
 
 func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {

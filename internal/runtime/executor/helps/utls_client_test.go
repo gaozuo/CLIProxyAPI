@@ -65,6 +65,17 @@ type handshakeUtlsDialer struct {
 	once    sync.Once
 }
 
+type firstWriteSignalConn struct {
+	net.Conn
+	started chan struct{}
+	once    sync.Once
+}
+
+func (c *firstWriteSignalConn) Write(p []byte) (int, error) {
+	c.once.Do(func() { close(c.started) })
+	return c.Conn.Write(p)
+}
+
 func (d *handshakeUtlsDialer) dial() (net.Conn, error) {
 	d.once.Do(func() { close(d.started) })
 	return d.client, nil
@@ -202,6 +213,12 @@ func TestUtlsRoundTripperCancelsProtectedHostDuringPendingWait(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timed out cleaning up first protected-host request")
 	}
+	roundTripper.mu.Lock()
+	_, pending := roundTripper.pending["chatgpt.com"]
+	roundTripper.mu.Unlock()
+	if pending {
+		t.Fatal("protected-host connection remained pending after creator cancellation")
+	}
 }
 
 func TestUtlsRoundTripperCancelsProtectedHostDuringTLSHandshake(t *testing.T) {
@@ -238,5 +255,39 @@ func TestUtlsRoundTripperCancelsProtectedHostDuringTLSHandshake(t *testing.T) {
 		_ = serverConn.Close()
 		<-done
 		t.Fatal("protected-host TLS handshake ignored request cancellation")
+	}
+}
+
+func TestHTTP2ClientConnCancellationClosesBlockingFirstWrite(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer func() { _ = serverConn.Close() }()
+	blockingConn := &firstWriteSignalConn{Conn: clientConn, started: make(chan struct{})}
+
+	cancelCause := errors.New("cancel HTTP/2 initialization")
+	ctx, cancel := context.WithCancelCause(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, errClientConn := newHTTP2ClientConn(ctx, blockingConn)
+		done <- errClientConn
+	}()
+
+	select {
+	case <-blockingConn.started:
+	case <-time.After(time.Second):
+		_ = clientConn.Close()
+		<-done
+		t.Fatal("timed out waiting for HTTP/2 client preface write")
+	}
+	cancel(cancelCause)
+
+	select {
+	case errClientConn := <-done:
+		if !errors.Is(errClientConn, cancelCause) {
+			t.Fatalf("newHTTP2ClientConn error = %v, want cancellation cause", errClientConn)
+		}
+	case <-time.After(250 * time.Millisecond):
+		_ = clientConn.Close()
+		<-done
+		t.Fatal("HTTP/2 client preface write ignored context cancellation")
 	}
 }
