@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -22,9 +21,10 @@ func (f utlsClientRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, e
 type controlledUtlsDialer struct {
 	started     chan struct{}
 	release     chan struct{}
+	mu          sync.Mutex
 	startedOnce sync.Once
 	releaseOnce sync.Once
-	calls       atomic.Int32
+	calls       int
 }
 
 func newControlledUtlsDialer() *controlledUtlsDialer {
@@ -35,8 +35,16 @@ func newControlledUtlsDialer() *controlledUtlsDialer {
 }
 
 func (d *controlledUtlsDialer) markStarted() {
-	d.calls.Add(1)
+	d.mu.Lock()
+	d.calls++
+	d.mu.Unlock()
 	d.startedOnce.Do(func() { close(d.started) })
+}
+
+func (d *controlledUtlsDialer) callCount() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.calls
 }
 
 func (d *controlledUtlsDialer) unblock() {
@@ -204,7 +212,7 @@ func TestUtlsRoundTripperCancelsProtectedHostDuringPendingWait(t *testing.T) {
 		t.Fatal("pending protected-host request ignored cancellation")
 	}
 
-	if got := dialer.calls.Load(); got != 1 {
+	if got := dialer.callCount(); got != 1 {
 		t.Fatalf("dial calls = %d, want 1 while second request waits", got)
 	}
 	cancelFirst()

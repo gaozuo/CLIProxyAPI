@@ -11,7 +11,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"time"
 
 	codexauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
@@ -1142,7 +1142,8 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
 	bootstrapTimeout := codexBootstrapTimeout(e.cfg)
-	var bootstrapState atomic.Uint32
+	var bootstrapMu sync.Mutex
+	bootstrapState := codexBootstrapPending
 	var bootstrapTimer *time.Timer
 	var timeoutErr statusErr
 	var cancelAttempt context.CancelCauseFunc
@@ -1152,20 +1153,27 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		cancelAttempt = cancel
 		httpReq = httpReq.WithContext(attemptCtx)
 		bootstrapTimer = time.AfterFunc(bootstrapTimeout, func() {
-			if bootstrapState.CompareAndSwap(codexBootstrapPending, codexBootstrapExpired) {
+			bootstrapMu.Lock()
+			if bootstrapState == codexBootstrapPending {
+				bootstrapState = codexBootstrapExpired
+				bootstrapMu.Unlock()
 				cancelAttempt(timeoutErr)
+				return
 			}
+			bootstrapMu.Unlock()
 		})
 	}
 	observeBootstrap := func() bool {
 		if bootstrapTimer == nil {
 			return true
 		}
-		if bootstrapState.CompareAndSwap(codexBootstrapPending, codexBootstrapObserved) {
+		bootstrapMu.Lock()
+		defer bootstrapMu.Unlock()
+		if bootstrapState == codexBootstrapPending {
+			bootstrapState = codexBootstrapObserved
 			bootstrapTimer.Stop()
-			return true
 		}
-		return bootstrapState.Load() == codexBootstrapObserved
+		return bootstrapState == codexBootstrapObserved
 	}
 	attemptOwnedByStream := false
 	defer func() {

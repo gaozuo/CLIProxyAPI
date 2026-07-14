@@ -7,7 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"sync/atomic"
+	"sync"
 	"testing"
 	"time"
 
@@ -23,13 +23,41 @@ func TestCodexBootstrapTimeoutRotatesAffinityAcrossPriorities(t *testing.T) {
 		_, _ = fmt.Fprintf(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":%q,\"object\":\"response\",\"created_at\":1775555723,\"status\":\"completed\",\"model\":\"gpt-5.5\",\"output\":[],\"usage\":{\"input_tokens\":8,\"output_tokens\":4,\"total_tokens\":12}}}\n\n", responseID)
 	}
 
-	var stalledCalls atomic.Int32
-	var stallEnabled atomic.Bool
+	var stateMu sync.Mutex
+	var stalledCalls, healthyCalls int
+	var stallEnabled bool
+	callCounts := func() (int, int) {
+		stateMu.Lock()
+		defer stateMu.Unlock()
+		return stalledCalls, healthyCalls
+	}
+	resetCalls := func() {
+		stateMu.Lock()
+		stalledCalls = 0
+		healthyCalls = 0
+		stateMu.Unlock()
+	}
+	setStallEnabled := func(enabled bool) {
+		stateMu.Lock()
+		stallEnabled = enabled
+		stateMu.Unlock()
+	}
+	recordStalledCall := func() bool {
+		stateMu.Lock()
+		defer stateMu.Unlock()
+		stalledCalls++
+		return stallEnabled
+	}
+	recordHealthyCall := func() {
+		stateMu.Lock()
+		healthyCalls++
+		stateMu.Unlock()
+	}
 	stalledCanceled := make(chan struct{})
 	stalledServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		stalledCalls.Add(1)
+		shouldStall := recordStalledCall()
 		_, _ = io.Copy(io.Discard, r.Body)
-		if !stallEnabled.Load() {
+		if !shouldStall {
 			writeCompleted(w, "resp_affinity_bound")
 			return
 		}
@@ -41,9 +69,8 @@ func TestCodexBootstrapTimeoutRotatesAffinityAcrossPriorities(t *testing.T) {
 	}))
 	defer stalledServer.Close()
 
-	var healthyCalls atomic.Int32
 	healthyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		healthyCalls.Add(1)
+		recordHealthyCall()
 		_, _ = io.Copy(io.Discard, r.Body)
 		writeCompleted(w, "resp_healthy")
 	}))
@@ -114,10 +141,11 @@ func TestCodexBootstrapTimeoutRotatesAffinityAcrossPriorities(t *testing.T) {
 	executeSuccessfulRequest("warmup", warmupBody)
 	executeSuccessfulRequest("affinity bind", requestBody)
 	executeSuccessfulRequest("affinity hit", requestBody)
-	if got := healthyCalls.Load(); got != 1 {
+	gotStalledCalls, gotHealthyCalls := callCounts()
+	if got := gotHealthyCalls; got != 1 {
 		t.Fatalf("healthy auth preflight calls = %d, want 1", got)
 	}
-	if got := stalledCalls.Load(); got != 2 {
+	if got := gotStalledCalls; got != 2 {
 		t.Fatalf("affinity-bound auth preflight calls = %d, want 2", got)
 	}
 
@@ -128,19 +156,18 @@ func TestCodexBootstrapTimeoutRotatesAffinityAcrossPriorities(t *testing.T) {
 			t.Fatalf("manager.Update(%s): %v", auth.ID, errUpdate)
 		}
 	}
-	stalledCalls.Store(0)
-	healthyCalls.Store(0)
+	resetCalls()
 	executeSuccessfulRequest("priority probe", priorityProbeBody)
-	if got := stalledCalls.Load(); got != 1 {
+	gotStalledCalls, gotHealthyCalls = callCounts()
+	if got := gotStalledCalls; got != 1 {
 		t.Fatalf("higher-priority auth calls during priority probe = %d, want 1", got)
 	}
-	if got := healthyCalls.Load(); got != 0 {
+	if got := gotHealthyCalls; got != 0 {
 		t.Fatalf("lexically earlier lower-priority auth calls during priority probe = %d, want 0", got)
 	}
 
-	stalledCalls.Store(0)
-	healthyCalls.Store(0)
-	stallEnabled.Store(true)
+	resetCalls()
+	setStallEnabled(true)
 
 	requestCtx, cancelRequest := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelRequest()
@@ -167,10 +194,11 @@ func TestCodexBootstrapTimeoutRotatesAffinityAcrossPriorities(t *testing.T) {
 	if !bytes.Contains(body, []byte("response.completed")) {
 		t.Fatalf("healthy completion missing from body %q", body)
 	}
-	if got := stalledCalls.Load(); got != 1 {
+	gotStalledCalls, gotHealthyCalls = callCounts()
+	if got := gotStalledCalls; got != 1 {
 		t.Fatalf("stalled auth calls = %d, want 1", got)
 	}
-	if got := healthyCalls.Load(); got != 1 {
+	if got := gotHealthyCalls; got != 1 {
 		t.Fatalf("healthy auth calls = %d, want 1", got)
 	}
 	select {
