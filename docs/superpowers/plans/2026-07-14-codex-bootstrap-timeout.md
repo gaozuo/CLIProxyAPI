@@ -4,9 +4,9 @@
 
 **Goal:** Add an opt-in Codex HTTP/SSE first-event timeout that cancels only the stalled credential attempt and reuses existing AuthManager failover.
 
-**Architecture:** Add the PR #4303-compatible configuration field, but enforce it inside `CodexExecutor.ExecuteStream` rather than around `AuthManager.ExecuteStream`. Use `context.WithCancelCause`, a standard timer, and an atomic pending/observed/expired state so the timeout becomes a normal 504 credential failure handled by existing `MarkResult` and request-local `tried` logic.
+**Architecture:** Add the PR #4303-compatible configuration field, but enforce it inside `CodexExecutor.ExecuteStream` rather than around `AuthManager.ExecuteStream`. Use `context.WithCancelCause`, a standard timer, and one function-local mutex protecting pending/observed/expired state so the timeout becomes a normal 504 credential failure handled by existing `MarkResult` and request-local `tried` logic.
 
-**Tech Stack:** Go 1.26+, `context`, `sync/atomic`, `net/http`, `httptest`, existing CLIProxyAPI AuthManager and executor test infrastructure.
+**Tech Stack:** Go 1.26+, `context`, `sync`, `net/http`, `httptest`, existing CLIProxyAPI AuthManager and executor test infrastructure.
 
 ## Global Constraints
 
@@ -16,6 +16,7 @@
 - Apply the timeout only to Codex HTTP/SSE before the first non-empty upstream `data:` event.
 - Do not modify New API, WebSocket behavior, selectors, affinity cache code, or handler retry architecture.
 - Use only standard-library concurrency primitives; do not add dependencies or a custom context type.
+- Add no `sync/atomic` import or `atomic.*` operation in production or tests.
 - Follow TDD: every production behavior change must be preceded by a failing test.
 - Run `gofmt` after Go changes and build `./cmd/server` before completion.
 
@@ -233,25 +234,30 @@ Expected: the first two tests exceed their guard deadline or return no 504 becau
 
 - [ ] **Step 3: Implement the attempt-local timeout**
 
-Add atomic states:
+Add plain states protected by one local mutex:
 
 ```go
 const (
-	codexBootstrapPending uint32 = iota
+	codexBootstrapPending = iota
 	codexBootstrapObserved
 	codexBootstrapExpired
 )
 ```
 
-In `ExecuteStream`, create a child attempt context only when the timeout is enabled, attach it to `httpReq`, and start `time.AfterFunc`. The callback must win only through:
+In `ExecuteStream`, create a child attempt context only when the timeout is enabled, attach it to `httpReq`, and start `time.AfterFunc`. Protect `bootstrapState` with `bootstrapMu`:
 
 ```go
-if bootstrapState.CompareAndSwap(codexBootstrapPending, codexBootstrapExpired) {
+bootstrapMu.Lock()
+if bootstrapState == codexBootstrapPending {
+	bootstrapState = codexBootstrapExpired
+	bootstrapMu.Unlock()
 	cancelAttempt(timeoutErr)
+	return
 }
+bootstrapMu.Unlock()
 ```
 
-Use one local `observeBootstrap` closure that stops the timer only when it wins pending to observed. Call it for an explicit HTTP response, the first non-empty `data:` event, and clean stream termination. If expired already won, return or emit `timeoutErr` instead of the context-canceled scanner error. Defer cancellation of the child context until the stream goroutine exits.
+Use one local `observeBootstrap` closure that locks `bootstrapMu`, changes pending to observed, and stops the timer before unlocking. It returns true for pending or already-observed state and false for expired state. Call it for an explicit HTTP response, the first non-empty `data:` event, and clean stream termination. If expired already won, return or emit `timeoutErr` instead of the context-canceled scanner error. Defer cancellation of the child context until the stream goroutine exits.
 
 - [ ] **Step 4: Run focused tests and verify GREEN**
 
@@ -325,42 +331,187 @@ git add sdk/api/handlers/codex_bootstrap_timeout_integration_test.go
 git commit -m "test(codex): cover affinity timeout failover"
 ```
 
-### Task 4: Complete verification and prepare the PR
+### Task 4: Remove every newly introduced atomic operation
 
 **Files:**
-- Modify only if verification exposes a defect in `internal/config/sdk_config.go`, `internal/runtime/executor/codex_executor.go`, `internal/runtime/executor/codex_bootstrap_timeout_test.go`, or `sdk/api/handlers/codex_bootstrap_timeout_integration_test.go`
-- Read: `.github/PULL_REQUEST_TEMPLATE.md`
+- Modify: `internal/runtime/executor/codex_executor.go`
+- Modify: `internal/runtime/executor/helps/utls_client_test.go`
+- Modify: `sdk/api/handlers/codex_bootstrap_timeout_integration_test.go`
 
 **Interfaces:**
-- Produces: a clean branch based on official `main`
-- Produces: a fork PR that documents AI assistance and the deliberate opt-in timeout exception
+- Preserves: existing bootstrap timeout, cancellation, affinity, and priority behavior
+- Produces: no added `sync/atomic` import or `atomic.*` operation relative to base `411d7d41`
 
-- [ ] **Step 1: Run fresh verification**
+- [ ] **Step 1: Run the branch guard and verify RED**
 
 ```bash
-go test -race ./internal/runtime/executor ./sdk/api/handlers -count=1
+added_atomic=$(git diff 411d7d41..HEAD -- '*.go' | rg '^\+.*("sync/atomic"|atomic\.)' || true)
+test -z "$added_atomic"
+```
+
+Expected before the refactor: exit 1 because the executor and two test files add atomic operations.
+
+- [ ] **Step 2: Replace executor atomic state with one local mutex**
+
+Use plain `int` state protected by `sync.Mutex`:
+
+```go
+var bootstrapMu sync.Mutex
+bootstrapState := codexBootstrapPending
+
+bootstrapTimer = time.AfterFunc(bootstrapTimeout, func() {
+	bootstrapMu.Lock()
+	if bootstrapState == codexBootstrapPending {
+		bootstrapState = codexBootstrapExpired
+		bootstrapMu.Unlock()
+		cancelAttempt(timeoutErr)
+		return
+	}
+	bootstrapMu.Unlock()
+})
+
+observeBootstrap := func() bool {
+	if bootstrapTimer == nil {
+		return true
+	}
+	bootstrapMu.Lock()
+	defer bootstrapMu.Unlock()
+	if bootstrapState == codexBootstrapPending {
+		bootstrapState = codexBootstrapObserved
+		bootstrapTimer.Stop()
+	}
+	return bootstrapState == codexBootstrapObserved
+}
+```
+
+Import `sync` instead of `sync/atomic`. Do not add a custom context, watcher goroutine, or handler wrapper.
+
+- [ ] **Step 3: Replace test atomics with mutex-protected state**
+
+In `utls_client_test.go`, protect the dial call count with the existing test dialer's mutex and expose a locked `callCount()` method.
+
+In `codex_bootstrap_timeout_integration_test.go`, use one local `sync.Mutex` protecting `stalledCalls`, `healthyCalls`, and `stallEnabled`. Read or mutate them only through small local closures such as `callCounts`, `resetCalls`, and `setStallEnabled`.
+
+- [ ] **Step 4: Format and verify GREEN**
+
+```bash
+gofmt -w internal/runtime/executor/codex_executor.go internal/runtime/executor/helps/utls_client_test.go sdk/api/handlers/codex_bootstrap_timeout_integration_test.go
+added_atomic=$(git diff 411d7d41..HEAD -- '*.go' | rg '^\+.*("sync/atomic"|atomic\.)' || true)
+test -z "$added_atomic"
+go test -race ./internal/runtime/executor -run '^(TestCodexBootstrapTimeout|TestCodexExecutorBootstrap)' -count=1 -timeout 60s
+go test -race ./internal/runtime/executor/helps -run '^(TestNewUtlsHTTPClient|TestUtlsRoundTripper|TestHTTP2)' -count=1 -timeout 60s
+go test -race ./sdk/api/handlers -run '^TestCodexBootstrapTimeout' -count=1 -timeout 60s
+git diff --check
+```
+
+Expected: the branch guard is silent and all commands exit 0.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add internal/runtime/executor/codex_executor.go internal/runtime/executor/helps/utls_client_test.go sdk/api/handlers/codex_bootstrap_timeout_integration_test.go
+git commit -m "refactor(codex): remove bootstrap atomic state"
+```
+
+### Task 5: Complete verification, review, and PR update
+
+**Files:**
+- Modify only when a verification failure identifies a defect in the reviewed paths
+- Read: `docs/superpowers/specs/2026-07-14-codex-bootstrap-timeout-design.md`
+
+**Interfaces:**
+- Produces: a clean, independently reviewed branch
+- Updates: `https://github.com/gaozuo/CLIProxyAPI/pull/1`
+
+- [ ] **Step 1: Run fresh complete verification**
+
+```bash
+go test -race ./internal/runtime/executor -run '^(TestCodexBootstrapTimeout|TestCodexExecutorBootstrap)' -count=1 -timeout 60s
+go test -race ./internal/runtime/executor/helps -run '^(TestNewUtlsHTTPClient|TestUtlsRoundTripper|TestHTTP2)' -count=1 -timeout 60s
+go test -race ./sdk/proxyutil -run '^TestBuildDialerHTTPProxy' -count=1 -timeout 60s
+go test -race ./sdk/api/handlers -run '^TestCodexBootstrapTimeout' -count=1 -timeout 60s
 go test -count=1 ./...
 out=$(mktemp /tmp/cliproxyapi-codex-bootstrap.XXXXXX)
 go build -o "$out" ./cmd/server
 rm -f "$out"
 git diff --check
+added_atomic=$(git diff 411d7d41..HEAD -- '*.go' | rg '^\+.*("sync/atomic"|atomic\.)' || true)
+test -z "$added_atomic"
 ```
 
-Expected: all commands exit 0.
+Expected: every command exits 0 and the atomic guard prints nothing.
 
 - [ ] **Step 2: Review the complete branch**
 
-Request an independent code review against merge base `411d7d41eee0ff841b5badba5abacad6c11331ef`. Fix all Critical and Important findings and rerun their covering tests.
+Generate a whole-branch review package from `411d7d41` to `HEAD`. Request an independent review that explicitly verifies the mutex transition, timeout boundary race, callback cancellation, test synchronization, and zero-added-atomic constraint. Fix all Critical and Important findings and rerun their covering tests.
 
-- [ ] **Step 3: Prepare the PR body**
-
-Use `.github/PULL_REQUEST_TEMPLATE.md`. State that the change is AI-assisted because the configured git identity is not an upstream core developer. Include configuration, behavior, test commands, default-off rollout, duplicate-billing caveat, and that the implementation intentionally avoids #4303's handler-level retry/context wrapper.
-
-- [ ] **Step 4: Push and create the PR**
+- [ ] **Step 3: Push and verify PR head**
 
 ```bash
-git push -u origin codex/codex-bootstrap-timeout
-gh pr create --repo gaozuo/CLIProxyAPI --base main --head codex/codex-bootstrap-timeout --title "fix(codex): timeout silent stream bootstrap" --body-file /tmp/cliproxyapi-codex-bootstrap-pr.md
+git push origin codex/codex-bootstrap-timeout
+gh pr view 1 --repo gaozuo/CLIProxyAPI --json state,isDraft,headRefOid,url
 ```
 
-Expected: a non-draft PR URL in the gaozuo fork.
+Expected: PR 1 is open, not draft, and its `headRefOid` equals local `HEAD`.
+
+### Task 6: Verify with copied production accounts in an isolated process
+
+**Files:**
+- Create only on the production host: `/tmp/cliproxyapi-bootstrap-verify-*`
+- Do not modify the production stack, production config, or original auth directory
+
+**Interfaces:**
+- Consumes: two copied Codex account JSON files from the production host
+- Produces: redacted evidence for default-off, healthy timeout disarm, and timed-out high-priority credential failover
+
+- [ ] **Step 1: Establish interactive SSH access without embedding a password**
+
+Run `ssh root@192.210.206.8` in an interactive terminal or install a temporary SSH public key. Do not place the production password in command arguments, shell history, logs, environment variables, or repository files.
+
+- [ ] **Step 2: Discover the running container and mounted sources read-only**
+
+```bash
+container=$(docker ps --format '{{.Names}}' | awk 'tolower($0) ~ /cliproxy/ {print; exit}')
+test -n "$container"
+docker inspect --format '{{range .Mounts}}{{println .Source "|" .Destination}}{{end}}' "$container"
+docker port "$container"
+```
+
+Select the host auth-directory mount and confirm at least two JSON files have `type: codex` without printing any other JSON values.
+
+- [ ] **Step 3: Build and upload isolated binaries**
+
+On the development workstation:
+
+```bash
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /tmp/cliproxyapi-bootstrap-candidate ./cmd/server
+scp /tmp/cliproxyapi-bootstrap-candidate root@192.210.206.8:/tmp/cliproxyapi-bootstrap-candidate
+```
+
+Expected: the candidate SHA256 is identical before and after transfer.
+
+- [ ] **Step 4: Create isolated config and copied auth directory**
+
+Create a mode-0700 temporary directory, copy exactly two Codex JSON files into its `auth` subdirectory, and set files to mode 0600. Use a JSON-aware tool on the copies only:
+
+- copied high-priority credential: `priority=10`, `proxy_url=http://127.0.0.1:19443`;
+- copied lower-priority credential: `priority=5`, remove `proxy_url`;
+- assign distinct copied filenames so the loader produces distinct auth IDs.
+
+Create a minimal configuration bound to `127.0.0.1:18317` with a freshly generated temporary API key, `auth-dir` pointing to the copied directory, `routing.session-affinity=true`, and `streaming.bootstrap-timeout-seconds=3`. Do not copy production API keys or management secrets.
+
+- [ ] **Step 5: Start a loopback black-hole proxy and isolated candidate**
+
+Set `verify_dir` to the mode-0700 temporary directory. Start a loopback-only TCP listener on `127.0.0.1:19443` that accepts connections and never replies. Start `/tmp/cliproxyapi-bootstrap-candidate --config "$verify_dir/config.yaml"` with stdout and stderr redirected to `$verify_dir/candidate.log`. Verify both PIDs belong to the isolated test and that only `127.0.0.1:18317` and `127.0.0.1:19443` are listening.
+
+- [ ] **Step 6: Execute three real requests**
+
+1. Timeout disabled: restart only the isolated candidate with `bootstrap-timeout-seconds: 0`; send one real `/v1/responses` request and require HTTP 200 plus `response.completed`.
+2. Healthy timeout enabled: use only the direct copied credential with timeout 3 seconds; require the first non-empty event before 3 seconds and successful completion.
+3. Failover: enable both copied credentials, use a fresh stable `conversation_id`, and require total latency of at least 3 seconds but below 30 seconds, one canceled connection at the black-hole listener, and successful completion through the lower-priority real credential.
+
+Select a supported Codex model from the isolated `/v1/models` response rather than hard-coding a production model name.
+
+- [ ] **Step 7: Validate redacted logs and clean up**
+
+Logs must prove priority-10 selection, timeout cancellation, request-local unavailability, affinity reselection, priority-5 success, and no terminal client error. Redact auth IDs before preserving evidence. Then terminate both isolated processes and remove the candidate binary and temporary directory. Confirm the production container ID, start time, ports, and health are unchanged from the pre-test snapshot.
