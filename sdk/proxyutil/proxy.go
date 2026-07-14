@@ -152,23 +152,36 @@ func BuildDialer(raw string) (proxy.Dialer, Mode, error) {
 
 type httpConnectDialer struct {
 	proxyURL *url.URL
-	dialer   proxy.Dialer
+	dialer   proxy.ContextDialer
 }
 
 func (d *httpConnectDialer) Dial(network, addr string) (net.Conn, error) {
-	proxyConn, errDial := d.dialer.Dial(network, proxyDialAddr(d.proxyURL))
+	return d.DialContext(context.Background(), network, addr)
+}
+
+func (d *httpConnectDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	proxyConn, errDial := d.dialer.DialContext(ctx, network, proxyDialAddr(d.proxyURL))
 	if errDial != nil {
 		return nil, fmt.Errorf("dial HTTP proxy failed: %w", errDial)
+	}
+	stopCancel := context.AfterFunc(ctx, func() { _ = proxyConn.Close() })
+	closeWithError := func(message string, errOperation error) (net.Conn, error) {
+		stopCancel()
+		errClose := proxyConn.Close()
+		if errContext := context.Cause(ctx); errContext != nil {
+			return nil, errContext
+		}
+		if errClose != nil {
+			return nil, fmt.Errorf("%s: %w; close failed: %v", message, errOperation, errClose)
+		}
+		return nil, fmt.Errorf("%s: %w", message, errOperation)
 	}
 
 	conn := proxyConn
 	if d.proxyURL.Scheme == "https" {
 		tlsConn := tls.Client(conn, &tls.Config{ServerName: d.proxyURL.Hostname()})
-		if errHandshake := tlsConn.Handshake(); errHandshake != nil {
-			if errClose := conn.Close(); errClose != nil {
-				return nil, fmt.Errorf("HTTPS proxy TLS handshake failed: %w; close failed: %v", errHandshake, errClose)
-			}
-			return nil, fmt.Errorf("HTTPS proxy TLS handshake failed: %w", errHandshake)
+		if errHandshake := tlsConn.HandshakeContext(ctx); errHandshake != nil {
+			return closeWithError("HTTPS proxy TLS handshake failed", errHandshake)
 		}
 		conn = tlsConn
 	}
@@ -183,28 +196,27 @@ func (d *httpConnectDialer) Dial(network, addr string) (net.Conn, error) {
 		req.Header.Set("Proxy-Authorization", proxyAuthorization(d.proxyURL.User))
 	}
 	if errWrite := req.Write(conn); errWrite != nil {
-		if errClose := conn.Close(); errClose != nil {
-			return nil, fmt.Errorf("write CONNECT request failed: %w; close failed: %v", errWrite, errClose)
-		}
-		return nil, fmt.Errorf("write CONNECT request failed: %w", errWrite)
+		return closeWithError("write CONNECT request failed", errWrite)
 	}
 
 	reader := bufio.NewReader(conn)
 	resp, errRead := http.ReadResponse(reader, req)
 	if errRead != nil {
-		if errClose := conn.Close(); errClose != nil {
-			return nil, fmt.Errorf("read CONNECT response failed: %w; close failed: %v", errRead, errClose)
-		}
-		return nil, fmt.Errorf("read CONNECT response failed: %w", errRead)
+		return closeWithError("read CONNECT response failed", errRead)
 	}
 	if resp.StatusCode != http.StatusOK {
 		if resp.Body != nil {
 			_ = resp.Body.Close()
 		}
+		stopCancel()
 		if errClose := conn.Close(); errClose != nil {
 			return nil, fmt.Errorf("proxy CONNECT returned status %s; close failed: %v", resp.Status, errClose)
 		}
 		return nil, fmt.Errorf("proxy CONNECT returned status %s", resp.Status)
+	}
+	if !stopCancel() {
+		_ = conn.Close()
+		return nil, context.Cause(ctx)
 	}
 
 	if reader.Buffered() > 0 {

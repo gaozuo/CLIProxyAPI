@@ -2,7 +2,9 @@ package proxyutil
 
 import (
 	"bufio"
+	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -10,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/net/proxy"
 )
 
 func mustDefaultTransport(t *testing.T) *http.Transport {
@@ -265,6 +269,80 @@ func TestBuildDialerHTTPProxyCONNECT(t *testing.T) {
 	}
 
 	if errServer := <-done; errServer != nil {
+		t.Fatalf("proxy server returned error: %v", errServer)
+	}
+}
+
+func TestBuildDialerHTTPProxyHonorsContextCancellation(t *testing.T) {
+	listener, errListen := net.Listen("tcp", "127.0.0.1:0")
+	if errListen != nil {
+		t.Fatalf("net.Listen returned error: %v", errListen)
+	}
+	defer func() { _ = listener.Close() }()
+
+	dialer, mode, errBuild := BuildDialer("http://" + listener.Addr().String())
+	if errBuild != nil {
+		t.Fatalf("BuildDialer returned error: %v", errBuild)
+	}
+	if mode != ModeProxy {
+		t.Fatalf("mode = %d, want %d", mode, ModeProxy)
+	}
+	contextDialer, ok := dialer.(proxy.ContextDialer)
+	if !ok {
+		t.Fatalf("dialer type %T does not implement proxy.ContextDialer", dialer)
+	}
+
+	connectReceived := make(chan struct{})
+	serverDone := make(chan error, 1)
+	go func() {
+		conn, errAccept := listener.Accept()
+		if errAccept != nil {
+			serverDone <- errAccept
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		req, errRead := http.ReadRequest(bufio.NewReader(conn))
+		if errRead != nil {
+			serverDone <- fmt.Errorf("read CONNECT request failed: %w", errRead)
+			return
+		}
+		if req.Method != http.MethodConnect {
+			serverDone <- fmt.Errorf("method = %s, want CONNECT", req.Method)
+			return
+		}
+		close(connectReceived)
+		buf := make([]byte, 1)
+		_, errRead = conn.Read(buf)
+		if errRead == nil {
+			serverDone <- errors.New("expected proxy connection to close")
+			return
+		}
+		serverDone <- nil
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	dialDone := make(chan error, 1)
+	go func() {
+		_, errDial := contextDialer.DialContext(ctx, "tcp", "target.example.com:443")
+		dialDone <- errDial
+	}()
+
+	select {
+	case <-connectReceived:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for CONNECT request")
+	}
+	cancel()
+
+	select {
+	case errDial := <-dialDone:
+		if !errors.Is(errDial, context.Canceled) {
+			t.Fatalf("DialContext error = %v, want context canceled", errDial)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("DialContext ignored cancellation while waiting for CONNECT response")
+	}
+	if errServer := <-serverDone; errServer != nil {
 		t.Fatalf("proxy server returned error: %v", errServer)
 	}
 }

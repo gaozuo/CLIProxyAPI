@@ -67,4 +67,9 @@ type StreamingConfig struct {
 	// to allow auth rotation / transient recovery.
 	// <= 0 disables bootstrap retries. Default is 0.
 	BootstrapRetries int `yaml:"bootstrap-retries,omitempty" json:"bootstrap-retries,omitempty"`
+
+	// BootstrapTimeoutSeconds limits how long a Codex HTTP/SSE stream may wait for
+	// its first non-empty upstream data event. <= 0 disables the timeout. Values
+	// above 600 are capped at 600 seconds.
+	BootstrapTimeoutSeconds int `yaml:"bootstrap-timeout-seconds,omitempty" json:"bootstrap-timeout-seconds,omitempty"`
 }

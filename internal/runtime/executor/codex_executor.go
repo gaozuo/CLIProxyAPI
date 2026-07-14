@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	codexauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
@@ -40,9 +41,31 @@ const (
 	codexDefaultImageToolModel = "gpt-image-2"
 	codexResponsesLiteHeader   = "X-OpenAI-Internal-Codex-Responses-Lite"
 	codexResponsesLiteMetadata = "client_metadata.ws_request_header_x_openai_internal_codex_responses_lite"
+	maxCodexBootstrapTimeout   = 10 * time.Minute
+)
+
+const (
+	codexBootstrapPending uint32 = iota
+	codexBootstrapObserved
+	codexBootstrapExpired
 )
 
 var dataTag = []byte("data:")
+
+func codexBootstrapTimeout(cfg *config.Config) time.Duration {
+	if cfg == nil || cfg.Streaming.BootstrapTimeoutSeconds <= 0 {
+		return 0
+	}
+	seconds := cfg.Streaming.BootstrapTimeoutSeconds
+	if seconds > int(maxCodexBootstrapTimeout/time.Second) {
+		return maxCodexBootstrapTimeout
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func codexBootstrapTimeoutError(timeout time.Duration) statusErr {
+	return statusErr{code: http.StatusGatewayTimeout, msg: fmt.Sprintf("codex upstream produced no payload within %s", timeout)}
+}
 
 // Streamed Codex responses may emit response.output_item.done events while leaving
 // response.completed.response.output empty. Keep the stream path aligned with the
@@ -1118,10 +1141,64 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 
 	httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
+	bootstrapTimeout := codexBootstrapTimeout(e.cfg)
+	var bootstrapMu sync.Mutex
+	bootstrapState := codexBootstrapPending
+	var bootstrapTimer *time.Timer
+	var timeoutErr statusErr
+	var cancelAttempt context.CancelCauseFunc
+	if bootstrapTimeout > 0 {
+		timeoutErr = codexBootstrapTimeoutError(bootstrapTimeout)
+		attemptCtx, cancel := context.WithCancelCause(httpReq.Context())
+		cancelAttempt = cancel
+		httpReq = httpReq.WithContext(attemptCtx)
+		bootstrapTimer = time.AfterFunc(bootstrapTimeout, func() {
+			bootstrapMu.Lock()
+			if bootstrapState == codexBootstrapPending {
+				bootstrapState = codexBootstrapExpired
+				bootstrapMu.Unlock()
+				cancelAttempt(timeoutErr)
+				return
+			}
+			bootstrapMu.Unlock()
+		})
+	}
+	observeBootstrap := func() bool {
+		if bootstrapTimer == nil {
+			return true
+		}
+		bootstrapMu.Lock()
+		defer bootstrapMu.Unlock()
+		if bootstrapState == codexBootstrapPending {
+			bootstrapState = codexBootstrapObserved
+			bootstrapTimer.Stop()
+		}
+		return bootstrapState == codexBootstrapObserved
+	}
+	attemptOwnedByStream := false
+	defer func() {
+		if cancelAttempt != nil && !attemptOwnedByStream {
+			observeBootstrap()
+			cancelAttempt(nil)
+		}
+	}()
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
+		if !observeBootstrap() && ctx.Err() == nil {
+			err = timeoutErr
+		}
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return nil, err
+	}
+	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		if !observeBootstrap() && ctx.Err() == nil {
+			if errClose := httpResp.Body.Close(); errClose != nil {
+				log.Errorf("codex executor: close response body error: %v", errClose)
+			}
+			helps.RecordAPIResponseError(ctx, e.cfg, timeoutErr)
+			err = timeoutErr
+			return nil, err
+		}
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
@@ -1143,6 +1220,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		return nil, err
 	}
 	out := make(chan cliproxyexecutor.StreamChunk)
+	attemptOwnedByStream = true
 	go func() {
 		defer close(out)
 		defer func() {
@@ -1150,13 +1228,33 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				log.Errorf("codex executor: close response body error: %v", errClose)
 			}
 		}()
+		if cancelAttempt != nil {
+			defer cancelAttempt(nil)
+		}
+		defer observeBootstrap()
 		scanner := bufio.NewScanner(httpResp.Body)
 		scanner.Buffer(nil, 52_428_800) // 50MB
 		var param any
 		outputItemsByIndex := make(map[int64][]byte)
 		var outputItemsFallback [][]byte
 		for scanner.Scan() {
-			line := applyCodexIdentityConfuseResponsePayload(scanner.Bytes(), identityState)
+			rawLine := scanner.Bytes()
+			if bytes.HasPrefix(rawLine, dataTag) {
+				rawData := bytes.TrimSpace(rawLine[5:])
+				if len(rawData) > 0 && !observeBootstrap() {
+					if ctx.Err() == nil {
+						helps.RecordAPIResponseError(ctx, e.cfg, timeoutErr)
+						reporter.PublishFailure(ctx, timeoutErr)
+						select {
+						case out <- cliproxyexecutor.StreamChunk{Err: timeoutErr}:
+						case <-ctx.Done():
+						}
+					}
+					return
+				}
+			}
+
+			line := applyCodexIdentityConfuseResponsePayload(rawLine, identityState)
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			translatedLine := bytes.Clone(line)
 
@@ -1204,7 +1302,17 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				}
 			}
 		}
-		if errScan := scanner.Err(); errScan != nil {
+		errScan := scanner.Err()
+		if !observeBootstrap() && ctx.Err() == nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, timeoutErr)
+			reporter.PublishFailure(ctx, timeoutErr)
+			select {
+			case out <- cliproxyexecutor.StreamChunk{Err: timeoutErr}:
+			case <-ctx.Done():
+			}
+			return
+		}
+		if errScan != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
 			reporter.PublishFailure(ctx, errScan)
 			select {
