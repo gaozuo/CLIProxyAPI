@@ -194,6 +194,7 @@ nonstream-keepalive-interval: 0
 # streaming:
 #   keepalive-seconds: 15   # Default: 0 (disabled). <= 0 disables keep-alives.
 #   bootstrap-retries: 1    # Default: 0 (disabled). Retries before first byte is sent.
+#   bootstrap-timeout-seconds: 20 # Codex HTTP/SSE only. <= 0 disables the timeout; values above 600 are capped at 600 seconds.
 
 # Signature cache validation for thinking blocks (Antigravity/Claude).
 # When true (default), cached signatures are preferred and validated.

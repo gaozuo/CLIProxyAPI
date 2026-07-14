@@ -40,9 +40,25 @@ const (
 	codexDefaultImageToolModel = "gpt-image-2"
 	codexResponsesLiteHeader   = "X-OpenAI-Internal-Codex-Responses-Lite"
 	codexResponsesLiteMetadata = "client_metadata.ws_request_header_x_openai_internal_codex_responses_lite"
+	maxCodexBootstrapTimeout   = 10 * time.Minute
 )
 
 var dataTag = []byte("data:")
+
+func codexBootstrapTimeout(cfg *config.Config) time.Duration {
+	if cfg == nil || cfg.Streaming.BootstrapTimeoutSeconds <= 0 {
+		return 0
+	}
+	seconds := cfg.Streaming.BootstrapTimeoutSeconds
+	if seconds > int(maxCodexBootstrapTimeout/time.Second) {
+		return maxCodexBootstrapTimeout
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func codexBootstrapTimeoutError(timeout time.Duration) statusErr {
+	return statusErr{code: http.StatusGatewayTimeout, msg: fmt.Sprintf("codex upstream produced no payload within %s", timeout)}
+}
 
 // Streamed Codex responses may emit response.output_item.done events while leaving
 // response.completed.response.output empty. Keep the stream path aligned with the
